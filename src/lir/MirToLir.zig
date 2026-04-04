@@ -1517,7 +1517,9 @@ fn ensureDirectProcSpec(
     }
 
     const proc_id = specialization.?.proc;
-    if (!self.lir_store.getProcSpec(proc_id).body.isNone() or specialization.?.status == .ready) return specialization.?;
+    if (!self.lir_store.getProcSpec(proc_id).body.isNone() or specialization.?.status == .ready) {
+        return specialization.?;
+    }
     if (specialization.?.status == .lowering) {
         return specialization.?;
     }
@@ -2997,7 +2999,7 @@ fn lowerTag(self: *Self, tag_data: anytype, mono_idx: Monotype.Idx, mir_expr_id:
 }
 
 fn lowerLookup(self: *Self, sym: Symbol, mono_idx: Monotype.Idx, mir_expr_id: MIR.ExprId, region: Region) Allocator.Error!LirExprId {
-    // Propagate MIR symbol definition to LIR store (if exists and not already done)
+    // Propagate MIR symbol definition to LIR store (if exists and not already done).
     if (self.lir_store.getSymbolDef(sym) == null) {
         if (self.mir_store.getValueDef(sym)) |mir_def_id| {
             const key: u64 = @bitCast(sym);
@@ -3056,7 +3058,8 @@ fn lowerLookup(self: *Self, sym: Symbol, mono_idx: Monotype.Idx, mir_expr_id: MI
         } }, region);
     }
 
-    return self.lir_store.addExpr(.{ .lookup = .{ .symbol = sym, .layout_idx = layout_idx } }, region);
+    const lir_lookup_id = try self.lir_store.addExpr(.{ .lookup = .{ .symbol = sym, .layout_idx = layout_idx } }, region);
+    return lir_lookup_id;
 }
 
 fn lowerMatch(self: *Self, match_data: anytype, mir_expr_id: MIR.ExprId, region: Region) Allocator.Error!LirExprId {
@@ -3227,6 +3230,7 @@ fn lowerClosureMake(
             capture_bindings[original_index].value_expr
         else
             mir_elems[original_index];
+
         const target_layout = layout_fields.get(li).layout;
         const lir_expr = try self.lowerExprToKnownRuntimeLayout(capture_expr, target_layout, region);
         const source_expr = if (self.isBorrowAtomicExpr(lir_expr))
@@ -3336,6 +3340,7 @@ fn lowerProcWithParamLayouts(
     const proc = self.mir_store.getProc(proc_id);
     const monotype = self.mir_store.monotype_store.getMonotype(proc.fn_monotype);
     const mir_params = self.mir_store.getPatternSpan(proc.params);
+
     if (builtin.mode == .Debug and mir_params.len != param_layouts.len) {
         std.debug.panic(
             "MirToLir invariant violated: lambda param layout count mismatch ({d} params, {d} layouts)",
