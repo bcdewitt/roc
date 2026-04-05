@@ -732,7 +732,14 @@ pub const Coordinator = struct {
     /// Main coordinator loop - unified for single and multi-threaded modes
     pub fn coordinatorLoop(self: *Coordinator) !void {
         var iterations_without_progress: usize = 0;
+        var loop_count: usize = 0;
         while (!self.isComplete()) {
+            loop_count += 1;
+            if (loop_count % 100_000 == 0) {
+                std.debug.print("[COORD-LOOP] iter={} total_remaining={} inflight={} tasks={}\n", .{
+                    loop_count, self.total_remaining, self.inflight.load(.acquire), self.task_channel.len(),
+                });
+            }
             var made_progress = false;
 
             if (!threads_available or self.mode == .single_threaded or self.max_threads <= 1) {

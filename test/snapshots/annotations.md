@@ -49,7 +49,7 @@ It has the type:
 
 But the annotation say it should be:
 
-    Pair(U8)
+    Pair(Str)
 
 **TYPE MISMATCH**
 This number is being used where a non-number type is needed:
@@ -77,7 +77,7 @@ It has the type:
 
 But the annotation say it should be:
 
-    Pair(U64)
+    Pair(Str)
 
 **TYPE MISMATCH**
 This number is being used where a non-number type is needed:

@@ -7,6 +7,7 @@
 //! - Object file generation (roc build --opt=dev) via symbol references
 
 const std = @import("std");
+const builtin = @import("builtin");
 const str = @import("str.zig");
 const list = @import("list.zig");
 const num = @import("num.zig");

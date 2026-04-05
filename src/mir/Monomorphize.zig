@@ -7779,20 +7779,39 @@ pub const Pass = struct {
         module_idx: u32,
         monotype: Monotype.Idx,
     ) Allocator.Error!void {
+        var visited: std.AutoHashMapUnmanaged(Monotype.Idx, void) = .empty;
+        defer visited.deinit(self.allocator);
+        try self.resolveStrInspectHelperProcInstsForMonotypeWithVisited(result, module_idx, monotype, &visited);
+    }
+
+    fn resolveStrInspectHelperProcInstsForMonotypeWithVisited(
+        self: *Pass,
+        result: *Result,
+        module_idx: u32,
+        monotype: Monotype.Idx,
+        visited: *std.AutoHashMapUnmanaged(Monotype.Idx, void),
+    ) Allocator.Error!void {
         if (monotype.isNone()) return;
+        // Cycle detection: recursive nominal types produce self-referential monotypes
+        // (e.g. Chain := [End, Link(Chain)] has Link's payload pointing to the same
+        // monotype idx as Chain itself). Without this guard the function would recurse
+        // infinitely, overflowing the process stack during compilation.
+        if (visited.contains(monotype)) return;
+        try visited.put(self.allocator, monotype, {});
+        defer _ = visited.remove(monotype);
 
         switch (result.monotype_store.getMonotype(monotype)) {
             .unit, .prim => {},
-            .list => |list_mono| try self.resolveStrInspectHelperProcInstsForMonotype(result, module_idx, list_mono.elem),
+            .list => |list_mono| try self.resolveStrInspectHelperProcInstsForMonotypeWithVisited(result, module_idx, list_mono.elem, visited),
             .box => |box_mono| {
                 try self.ensureBuiltinBoxUnboxProcInst(result, module_idx, monotype, box_mono.inner);
-                try self.resolveStrInspectHelperProcInstsForMonotype(result, module_idx, box_mono.inner);
+                try self.resolveStrInspectHelperProcInstsForMonotypeWithVisited(result, module_idx, box_mono.inner, visited);
             },
             .tuple => |tuple_mono| {
                 var elem_i: usize = 0;
                 while (elem_i < tuple_mono.elems.len) : (elem_i += 1) {
                     const elem_mono = result.monotype_store.getIdxSpanItem(tuple_mono.elems, elem_i);
-                    try self.resolveStrInspectHelperProcInstsForMonotype(result, module_idx, elem_mono);
+                    try self.resolveStrInspectHelperProcInstsForMonotypeWithVisited(result, module_idx, elem_mono, visited);
                 }
             },
             .func => {},
@@ -7800,7 +7819,7 @@ pub const Pass = struct {
                 var field_i: usize = 0;
                 while (field_i < record_mono.fields.len) : (field_i += 1) {
                     const field = result.monotype_store.getFieldItem(record_mono.fields, field_i);
-                    try self.resolveStrInspectHelperProcInstsForMonotype(result, module_idx, field.type_idx);
+                    try self.resolveStrInspectHelperProcInstsForMonotypeWithVisited(result, module_idx, field.type_idx, visited);
                 }
             },
             .tag_union => |tag_union_mono| {
@@ -7810,7 +7829,7 @@ pub const Pass = struct {
                     var payload_i: usize = 0;
                     while (payload_i < tag.payloads.len) : (payload_i += 1) {
                         const payload_mono = result.monotype_store.getIdxSpanItem(tag.payloads, payload_i);
-                        try self.resolveStrInspectHelperProcInstsForMonotype(result, module_idx, payload_mono);
+                        try self.resolveStrInspectHelperProcInstsForMonotypeWithVisited(result, module_idx, payload_mono, visited);
                     }
                 }
             },

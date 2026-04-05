@@ -513,10 +513,10 @@ fn wrapStrEscapeAndQuote(out: *RocStr, str_bytes: ?[*]u8, str_len: usize, str_ca
 }
 
 /// Wrapper: listConcat(RocList, RocList, alignment, element_width, ..., *RocOps) -> RocList
-fn wrapListConcat(out: *RocList, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, alignment: u32, element_width: usize, roc_ops: *RocOps) callconv(.c) void {
+fn wrapListConcat(out: *RocList, a_bytes: ?[*]u8, a_len: usize, a_cap: usize, b_bytes: ?[*]u8, b_len: usize, b_cap: usize, alignment: u32, element_width: usize, elements_refcounted: bool, roc_ops: *RocOps) callconv(.c) void {
     const a = RocList{ .bytes = a_bytes, .length = a_len, .capacity_or_alloc_ptr = a_cap };
     const b = RocList{ .bytes = b_bytes, .length = b_len, .capacity_or_alloc_ptr = b_cap };
-    out.* = listConcat(a, b, alignment, element_width, false, null, @ptrCast(&rcNone), null, @ptrCast(&rcNone), roc_ops);
+    out.* = listConcat(a, b, alignment, element_width, elements_refcounted, null, @ptrCast(&rcNone), null, @ptrCast(&rcNone), roc_ops);
 }
 
 /// Wrapper: listPrepend(RocList, alignment, element, element_width, ..., *RocOps) -> RocList
@@ -1890,14 +1890,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const ls = self.layout_store;
                     const roc_ops_reg = self.roc_ops_reg orelse unreachable;
 
-                    const elem_size_align: layout.SizeAlign = blk: {
-                        const ret_layout = ls.getLayout(ll.ret_layout);
-                        break :blk switch (ret_layout.tag) {
-                            .list => ls.layoutSizeAlign(ls.getLayout(ret_layout.data.list)),
-                            .list_of_zst => .{ .size = 0, .alignment = .@"1" },
-                            else => unreachable,
-                        };
+                    const ret_layout = ls.getLayout(ll.ret_layout);
+                    const elem_size_align: layout.SizeAlign = switch (ret_layout.tag) {
+                        .list => ls.layoutSizeAlign(ls.getLayout(ret_layout.data.list)),
+                        .list_of_zst => .{ .size = 0, .alignment = .@"1" },
+                        else => unreachable,
                     };
+                    const elements_refcounted: bool = if (ret_layout.tag == .list)
+                        ls.layoutContainsRefcounted(ls.getLayout(ret_layout.data.list))
+                    else
+                        false;
 
                     const list_a_off = try self.ensureOnStack(list_a_loc, roc_list_size);
                     const list_b_off = try self.ensureOnStack(list_b_loc, roc_list_size);
@@ -1906,7 +1908,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const fn_addr: usize = @intFromPtr(&wrapListConcat);
 
                     {
-                        // wrapListConcat(out, a_bytes, a_len, a_cap, b_bytes, b_len, b_cap, alignment, element_width, roc_ops)
+                        // wrapListConcat(out, a_bytes, a_len, a_cap, b_bytes, b_len, b_cap, alignment, element_width, elements_refcounted, roc_ops)
                         const base_reg = frame_ptr;
                         var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
 
@@ -1919,6 +1921,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         try builder.addMemArg(base_reg, list_b_off + 16);
                         try builder.addImmArg(@intCast(alignment_bytes));
                         try builder.addImmArg(@intCast(elem_size_align.size));
+                        try builder.addImmArg(if (elements_refcounted) 1 else 0);
                         try builder.addRegArg(roc_ops_reg);
 
                         try self.callBuiltin(&builder, fn_addr, .list_concat);
@@ -3458,12 +3461,15 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     const roc_ops_reg = self.roc_ops_reg orelse unreachable;
 
                     // Allocate heap memory via allocateWithRefcountC
+                    // Note: elements_refcounted=false because Box is not a seamless slice.
+                    // The elements_refcounted flag allocates extra space for element count,
+                    // which is only needed for Lists. Box uses the standard 8-byte refcount prefix.
                     const heap_ptr_slot: i32 = self.codegen.allocStackSlot(8);
                     {
                         var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
                         try builder.addImmArg(@intCast(elem_size));
                         try builder.addImmArg(@intCast(elem_alignment));
-                        try builder.addImmArg(if (box_info.contains_refcounted) 1 else 0);
+                        try builder.addImmArg(0); // elements_refcounted=false for Box
                         try builder.addRegArg(roc_ops_reg);
                         try self.callBuiltin(&builder, @intFromPtr(&allocateWithRefcountC), .allocate_with_refcount);
                     }
@@ -7625,7 +7631,24 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             expected_layout_idx: layout.Idx,
             runtime_layout_idx: layout.Idx,
         ) Allocator.Error!bool {
+            var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+            defer seen.deinit(self.allocator);
+            return self.layoutsStructurallyCompatibleRec(expected_layout_idx, runtime_layout_idx, &seen);
+        }
+
+        fn layoutsStructurallyCompatibleRec(
+            self: *Self,
+            expected_layout_idx: layout.Idx,
+            runtime_layout_idx: layout.Idx,
+            seen: *std.AutoHashMapUnmanaged(u64, void),
+        ) Allocator.Error!bool {
             if (expected_layout_idx == runtime_layout_idx) return true;
+
+            // Cycle detection: if we've already started comparing this pair, assume compatible.
+            // This handles recursive types like Ch := [End, Link(List(Ch))].
+            const pair_key: u64 = (@as(u64, @intFromEnum(expected_layout_idx)) << 32) | @intFromEnum(runtime_layout_idx);
+            if (seen.contains(pair_key)) return true;
+            try seen.put(self.allocator, pair_key, {});
 
             const ls = self.layout_store;
             const expected_layout = ls.getLayout(expected_layout_idx);
@@ -7634,8 +7657,8 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             if (expected_layout.tag != runtime_layout.tag) return false;
 
             return switch (expected_layout.tag) {
-                .box => try self.layoutsStructurallyCompatible(expected_layout.data.box, runtime_layout.data.box),
-                .list => try self.layoutsStructurallyCompatible(expected_layout.data.list, runtime_layout.data.list),
+                .box => try self.layoutsStructurallyCompatibleRec(expected_layout.data.box, runtime_layout.data.box, seen),
+                .list => try self.layoutsStructurallyCompatibleRec(expected_layout.data.list, runtime_layout.data.list, seen),
                 .struct_ => blk: {
                     if (expected_layout.data.struct_.alignment != runtime_layout.data.struct_.alignment) break :blk false;
 
@@ -7650,16 +7673,17 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         const expected_field = expected_fields.get(i);
                         const runtime_field = runtime_fields.get(i);
                         if (expected_field.index != runtime_field.index) break :blk false;
-                        if (!try self.layoutsStructurallyCompatible(expected_field.layout, runtime_field.layout)) {
+                        if (!try self.layoutsStructurallyCompatibleRec(expected_field.layout, runtime_field.layout, seen)) {
                             break :blk false;
                         }
                     }
 
                     break :blk true;
                 },
-                .closure => try self.layoutsStructurallyCompatible(
+                .closure => try self.layoutsStructurallyCompatibleRec(
                     expected_layout.data.closure.captures_layout_idx,
                     runtime_layout.data.closure.captures_layout_idx,
+                    seen,
                 ),
                 .tag_union => blk: {
                     if (expected_layout.data.tag_union.alignment != runtime_layout.data.tag_union.alignment) break :blk false;
@@ -7672,9 +7696,10 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (expected_variants.len != runtime_variants.len) break :blk false;
 
                     for (0..expected_variants.len) |i| {
-                        if (!try self.layoutsStructurallyCompatible(
+                        if (!try self.layoutsStructurallyCompatibleRec(
                             expected_variants.get(i).payload_layout,
                             runtime_variants.get(i).payload_layout,
+                            seen,
                         )) {
                             break :blk false;
                         }
@@ -7993,7 +8018,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Generate code for match expression
         fn generateMatch(self: *Self, when_expr: anytype) Allocator.Error!ValueLocation {
             // Evaluate the scrutinee (the value being matched)
-            const value_loc = try self.generateExpr(when_expr.value);
+            const raw_value_loc = try self.generateExpr(when_expr.value);
             // Get the branches
             const branches = self.store.getMatchBranches(when_expr.branches);
             if (branches.len == 0) {
@@ -8005,7 +8030,33 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             const result_layout_val = ls.getLayout(when_expr.result_layout);
             var result_size: u32 = ls.layoutSizeAlign(result_layout_val).size;
             var use_stack_result = result_size > 8;
-            const value_layout_val = ls.getLayout(when_expr.value_layout);
+
+            // If the scrutinee has .box layout, the value is a heap pointer to the actual data.
+            // This arises when a recursive nominal type is bound from a tag pattern arm — the
+            // runtime value is a box pointer, not an inline tag union. Dereference and copy the
+            // inner bytes to a stack slot so discriminant-check and payload-bind code works normally.
+            const value_loc, const effective_layout_idx = blk: {
+                const raw_layout = ls.getLayout(when_expr.value_layout);
+                if (raw_layout.tag != .box) break :blk .{ raw_value_loc, when_expr.value_layout };
+                const inner_layout_idx = raw_layout.data.box;
+                const inner_layout = ls.getLayout(inner_layout_idx);
+                const inner_size = ls.layoutSizeAlign(inner_layout).size;
+                if (inner_size == 0) break :blk .{ ValueLocation{ .immediate_i64 = 0 }, inner_layout_idx };
+                const inner_slot = self.codegen.allocStackSlot(inner_size);
+                const box_ptr_reg = try self.ensureInGeneralReg(raw_value_loc);
+                defer self.codegen.freeGeneral(box_ptr_reg);
+                var copied: u32 = 0;
+                while (copied < inner_size) {
+                    const temp = try self.allocTempGeneral();
+                    try self.emitLoad(.w64, temp, box_ptr_reg, @intCast(copied));
+                    try self.emitStore(.w64, frame_ptr, inner_slot + @as(i32, @intCast(copied)), temp);
+                    self.codegen.freeGeneral(temp);
+                    copied += 8;
+                }
+                break :blk .{ self.stackLocationForLayout(inner_layout_idx, inner_slot), inner_layout_idx };
+            };
+
+            const value_layout_val = ls.getLayout(effective_layout_idx);
             const tu_disc_offset: i32 = if (value_layout_val.tag == .tag_union) blk: {
                 const tu_data = ls.getTagUnionData(value_layout_val.data.tag_union.idx);
                 break :blk @intCast(tu_data.discriminant_offset);
@@ -8162,14 +8213,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             try self.emitInnerTagArgDiscriminantChecks(
                                 tag_pattern,
                                 value_loc,
-                                when_expr.value_layout,
+                                effective_layout_idx,
                                 value_layout_val,
                                 &inner_fail_patches,
                             );
                         }
 
                         // Bind tag payload fields
-                        try self.bindTagPayloadFields(tag_pattern, value_loc, when_expr.value_layout, value_layout_val);
+                        try self.bindTagPayloadFields(tag_pattern, value_loc, effective_layout_idx, value_layout_val);
 
                         // Guard check (after bindings, since guard may reference bound vars)
                         const guard_patch = try self.emitGuardCheck(branch.guard);
@@ -8701,7 +8752,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
             // Get the union layout
             const union_layout = ls.getLayout(tag.union_layout);
-
             // For simple tags that fit in a register, just return the discriminant
             if (union_layout.tag == .scalar or union_layout.tag == .zst) {
                 return .{ .immediate_i64 = tag.discriminant };
@@ -8732,6 +8782,53 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             try self.storeDiscriminant(base_offset + @as(i32, @intCast(disc_offset)), tag.discriminant, disc_size);
 
             return .{ .stack = .{ .offset = base_offset } };
+        }
+
+        /// Box a value inline: heap-allocate with refcount header, copy value to heap,
+        /// return a register containing the heap pointer.
+        /// Used for recursive type payloads where the field layout is .box.
+        fn boxValueInline(self: *Self, value_loc: ValueLocation, box_layout: layout.Layout) Allocator.Error!ValueLocation {
+            const ls = self.layout_store;
+            const box_info = ls.getBoxInfo(box_layout);
+            const elem_size: u32 = box_info.elem_size;
+            const elem_alignment: u32 = box_info.elem_alignment;
+
+            if (elem_size == 0) {
+                // ZST: return null pointer
+                const reg = try self.allocTempGeneral();
+                try self.codegen.emitLoadImm(reg, 0);
+                return .{ .general_reg = reg };
+            }
+
+            const roc_ops_reg = self.roc_ops_reg orelse unreachable;
+
+            // Save the value to stack first (it may be in a register that gets clobbered)
+            const value_offset = try self.ensureOnStack(value_loc, elem_size);
+
+            // Allocate heap memory via allocateWithRefcountC
+            // Note: elements_refcounted=false because Box is not a seamless slice.
+            // The elements_refcounted flag is only for Lists (seamless slice element count).
+            const heap_ptr_slot: i32 = self.codegen.allocStackSlot(8);
+            {
+                var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+                try builder.addImmArg(@intCast(elem_size));
+                try builder.addImmArg(@intCast(elem_alignment));
+                try builder.addImmArg(0); // elements_refcounted=false for Box
+                try builder.addRegArg(roc_ops_reg);
+                try self.callBuiltin(&builder, @intFromPtr(&allocateWithRefcountC), .allocate_with_refcount);
+            }
+            // Save heap pointer to stack slot (ret_reg_0 may be clobbered by copyChunked)
+            try self.emitStore(.w64, frame_ptr, heap_ptr_slot, ret_reg_0);
+
+            // Load heap pointer back into a temp register and copy value to heap
+            const heap_ptr = try self.allocTempGeneral();
+            try self.emitLoad(.w64, heap_ptr, frame_ptr, heap_ptr_slot);
+            const temp_reg = try self.allocTempGeneral();
+            try self.copyChunked(temp_reg, frame_ptr, value_offset, heap_ptr, 0, elem_size);
+            self.codegen.freeGeneral(temp_reg);
+
+            // Return the heap pointer (which IS the Box value — an 8-byte pointer)
+            return .{ .general_reg = heap_ptr };
         }
 
         /// Generate code for a tag with payload arguments
@@ -8776,11 +8873,44 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             if (arg_exprs.len == 1) {
                 // Single argument: the payload layout directly tells us the size
                 const arg_loc = try self.generateExpr(arg_exprs[0]);
-                const payload_size: u32 = if (variant_payload_layout) |pl| blk: {
+
+                if (variant_payload_layout) |pl| {
                     const pl_val = ls.getLayout(pl);
-                    break :blk ls.layoutSizeAlign(pl_val).size;
-                } else self.valueSizeFromLoc(arg_loc);
-                try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                    if (pl_val.tag == .struct_) {
+                        // Check if this single-field struct contains a box field.
+                        const struct_data = ls.getStructData(pl_val.data.struct_.idx);
+                        if (struct_data.fields.count == 1) {
+                            const field_slice = ls.struct_fields.sliceRange(struct_data.getFields());
+                            const field_layout = ls.getLayout(field_slice.get(0).layout);
+                            if (field_layout.tag == .box) {
+                                // Field expects a box. Check if the arg expression already
+                                // produces a box value (explicit Box.box() call) — if so, skip boxing.
+                                const arg_layout_idx = self.exprLayout(arg_exprs[0]);
+                                const arg_layout = ls.getLayout(arg_layout_idx);
+                                if (arg_layout.tag == .box or arg_layout.tag == .box_of_zst) {
+                                    // Already boxed (explicit Box.box), just copy the pointer
+                                    try self.copyBytesToStackOffset(base_offset, arg_loc, 8);
+                                } else {
+                                    // Not boxed yet (recursive type) — heap-allocate and copy
+                                    const boxed_loc = try self.boxValueInline(arg_loc, field_layout);
+                                    try self.copyBytesToStackOffset(base_offset, boxed_loc, 8);
+                                }
+                            } else {
+                                const payload_size = ls.layoutSizeAlign(pl_val).size;
+                                try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                            }
+                        } else {
+                            const payload_size = ls.layoutSizeAlign(pl_val).size;
+                            try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                        }
+                    } else {
+                        const payload_size = ls.layoutSizeAlign(pl_val).size;
+                        try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                    }
+                } else {
+                    const payload_size = self.valueSizeFromLoc(arg_loc);
+                    try self.copyBytesToStackOffset(base_offset, arg_loc, payload_size);
+                }
             } else {
                 // Multiple arguments: use the variant's payload tuple layout to get
                 // field offsets and sizes. This correctly handles boxed/recursive types
@@ -8796,12 +8926,30 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         @intCast(ls.getStructFieldOffsetByOriginalIndex(tuple_idx, @intCast(arg_i)))
                     else
                         @as(i32, @intCast(arg_i)) * 8;
-                    const elem_size: u32 = if (payload_tuple) |tuple_idx| blk: {
-                        const elem_layout = ls.getStructFieldLayoutByOriginalIndex(tuple_idx, @intCast(arg_i));
-                        const elem_layout_val = ls.getLayout(elem_layout);
-                        break :blk ls.layoutSizeAlign(elem_layout_val).size;
-                    } else self.valueSizeFromLoc(arg_loc);
-                    try self.copyBytesToStackOffset(base_offset + elem_offset, arg_loc, elem_size);
+
+                    if (payload_tuple) |tuple_idx| {
+                        const elem_layout_idx = ls.getStructFieldLayoutByOriginalIndex(tuple_idx, @intCast(arg_i));
+                        const elem_layout_val = ls.getLayout(elem_layout_idx);
+                        if (elem_layout_val.tag == .box) {
+                            // Field expects a box. Check if arg already produces a box.
+                            const arg_layout_idx = self.exprLayout(arg_expr_id);
+                            const arg_layout = ls.getLayout(arg_layout_idx);
+                            if (arg_layout.tag == .box or arg_layout.tag == .box_of_zst) {
+                                // Already boxed, just copy the pointer
+                                try self.copyBytesToStackOffset(base_offset + elem_offset, arg_loc, 8);
+                            } else {
+                                // Not boxed yet — heap-allocate and copy
+                                const boxed_loc = try self.boxValueInline(arg_loc, elem_layout_val);
+                                try self.copyBytesToStackOffset(base_offset + elem_offset, boxed_loc, 8);
+                            }
+                        } else {
+                            const elem_size = ls.layoutSizeAlign(elem_layout_val).size;
+                            try self.copyBytesToStackOffset(base_offset + elem_offset, arg_loc, elem_size);
+                        }
+                    } else {
+                        const elem_size = self.valueSizeFromLoc(arg_loc);
+                        try self.copyBytesToStackOffset(base_offset + elem_offset, arg_loc, elem_size);
+                    }
                 }
             }
 
@@ -13188,8 +13336,6 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         }
 
         /// Compile a single procedure as a complete unit.
-        /// Uses deferred prologue pattern: generates body first to determine which
-        /// callee-saved registers are used, then prepends prologue and adjusts relocations.
         fn compileProcSpec(self: *Self, proc_id: lir.LIR.LirProcSpecId, proc: LirProcSpec) Allocator.Error!void {
             const key: u32 = @intFromEnum(proc_id);
             // Save current state - procedure has its own scope that shouldn't pollute caller
@@ -15073,7 +15219,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
         /// Like generateMatch but each branch body is a CFStmt (handles its own ret/jump).
         fn generateMatchStmt(self: *Self, ms: anytype) Allocator.Error!void {
             // Evaluate the scrutinee
-            const value_loc = try self.generateExpr(ms.value);
+            const raw_value_loc = try self.generateExpr(ms.value);
 
             const branches = self.store.getCFMatchBranches(ms.branches);
             if (branches.len == 0) {
@@ -15082,7 +15228,31 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
 
             // Get layout info for tag unions
             const ls = self.layout_store;
-            const value_layout_val = ls.getLayout(ms.value_layout);
+
+            // If the scrutinee has .box layout, dereference the heap pointer and copy the inner
+            // value to a stack slot (same logic as in generateMatch).
+            const value_loc, const effective_layout_idx = blk: {
+                const raw_layout = ls.getLayout(ms.value_layout);
+                if (raw_layout.tag != .box) break :blk .{ raw_value_loc, ms.value_layout };
+                const inner_layout_idx = raw_layout.data.box;
+                const inner_layout = ls.getLayout(inner_layout_idx);
+                const inner_size = ls.layoutSizeAlign(inner_layout).size;
+                if (inner_size == 0) break :blk .{ ValueLocation{ .immediate_i64 = 0 }, inner_layout_idx };
+                const inner_slot = self.codegen.allocStackSlot(inner_size);
+                const box_ptr_reg = try self.ensureInGeneralReg(raw_value_loc);
+                defer self.codegen.freeGeneral(box_ptr_reg);
+                var copied: u32 = 0;
+                while (copied < inner_size) {
+                    const temp = try self.allocTempGeneral();
+                    try self.emitLoad(.w64, temp, box_ptr_reg, @intCast(copied));
+                    try self.emitStore(.w64, frame_ptr, inner_slot + @as(i32, @intCast(copied)), temp);
+                    self.codegen.freeGeneral(temp);
+                    copied += 8;
+                }
+                break :blk .{ self.stackLocationForLayout(inner_layout_idx, inner_slot), inner_layout_idx };
+            };
+
+            const value_layout_val = ls.getLayout(effective_layout_idx);
             const tu_disc_offset: i32 = if (value_layout_val.tag == .tag_union) blk: {
                 const tu_data = ls.getTagUnionData(value_layout_val.data.tag_union.idx);
                 break :blk @intCast(tu_data.discriminant_offset);
@@ -15204,14 +15374,14 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                             try self.emitInnerTagArgDiscriminantChecks(
                                 tag_pattern,
                                 value_loc,
-                                ms.value_layout,
+                                effective_layout_idx,
                                 value_layout_val,
                                 &inner_fail_patches,
                             );
                         }
 
                         // Bind tag payload fields
-                        try self.bindTagPayloadFields(tag_pattern, value_loc, ms.value_layout, value_layout_val);
+                        try self.bindTagPayloadFields(tag_pattern, value_loc, effective_layout_idx, value_layout_val);
 
                         // Guard check (after bindings, since guard may reference bound vars)
                         const guard_patch = try self.emitGuardCheck(branch.guard);

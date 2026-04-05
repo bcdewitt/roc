@@ -564,6 +564,7 @@ inline fn free_ptr_to_refcount(
     const ptr_width = @sizeOf(usize);
     const required_space: usize = if (elements_refcounted) (2 * ptr_width) else ptr_width;
     const extra_bytes = @max(required_space, element_alignment);
+
     const allocation_ptr = @as([*]u8, @ptrCast(refcount_ptr)) - (extra_bytes - @sizeOf(usize));
 
     // Use the same alignment calculation as allocateWithRefcount

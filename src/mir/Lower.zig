@@ -153,6 +153,11 @@ in_progress_symbol_monotypes: std.AutoHashMap(u64, Monotype.Idx),
 /// dispatch resolution data directly.
 resolved_dispatch_targets: std.AutoHashMap(u64, ResolvedDispatchTarget),
 
+/// Nominal type vars currently being lowered by lowerStrInspectNominal.
+/// Detects cycles for recursive nominal types (e.g. Chain := [End, Link(Chain)])
+/// so lowerStrInspectNominal can emit a placeholder instead of recursing forever.
+str_inspect_visiting: std.AutoHashMap(types.Var, void),
+
 scratch_expr_ids: base.Scratch(MIR.ExprId),
 scratch_pattern_ids: base.Scratch(MIR.PatternId),
 scratch_ident_idxs: base.Scratch(Ident.Idx),
@@ -219,6 +224,7 @@ pub fn init(
         .current_root_expr_context = null,
         .in_progress_symbol_monotypes = std.AutoHashMap(u64, Monotype.Idx).init(allocator),
         .resolved_dispatch_targets = resolved_dispatch_targets,
+        .str_inspect_visiting = std.AutoHashMap(types.Var, void).init(allocator),
         .scratch_expr_ids = try base.Scratch(MIR.ExprId).init(allocator),
         .scratch_pattern_ids = try base.Scratch(MIR.PatternId).init(allocator),
         .scratch_ident_idxs = try base.Scratch(Ident.Idx).init(allocator),
@@ -252,6 +258,7 @@ pub fn deinit(self: *Self) void {
     self.skipped_proc_backed_binding_patterns.deinit();
     self.in_progress_symbol_monotypes.deinit();
     self.resolved_dispatch_targets.deinit();
+    self.str_inspect_visiting.deinit();
     self.scratch_expr_ids.deinit();
     self.scratch_pattern_ids.deinit();
     self.scratch_ident_idxs.deinit();
@@ -1927,6 +1934,18 @@ fn lowerStrInspectNominal(
     nominal: types.NominalType,
     region: Region,
 ) Allocator.Error!MIR.ExprId {
+    // Cycle detection for recursive nominal types (e.g. Chain := [End, Link(Chain)]).
+    // Use the resolved type var as the key so all references to the same recursive
+    // Chain resolve to the same entry.
+    const resolved_var = type_env.types.resolveVar(type_var).var_;
+    if (self.str_inspect_visiting.contains(resolved_var)) {
+        // This nominal is already being inspected upstream in the call chain.
+        // Break the cycle by emitting a self-referential placeholder.
+        return self.emitMirStrLiteral("<recursive>", region);
+    }
+    try self.str_inspect_visiting.put(resolved_var, {});
+    defer _ = self.str_inspect_visiting.remove(resolved_var);
+
     const common = ModuleEnv.CommonIdents.find(&type_env.common);
     const ident = nominal.ident.ident_idx;
 
@@ -6049,12 +6068,17 @@ fn lowerCallWithLoweredFunc(
 
     const args_top = self.scratch_expr_ids.top();
     defer self.scratch_expr_ids.clearFrom(args_top);
-    const expected_arg_monotypes = switch (self.store.monotype_store.getMonotype(func_mono)) {
-        .func => |func| self.store.monotype_store.getIdxSpan(func.args),
-        else => &.{},
+    // Store the Span descriptor (a value type: start + len) rather than a
+    // direct slice into monotype_store.extra_idx.  Recursive lowerExpr calls
+    // below may add monotypes, triggering a reallocation that would
+    // invalidate any borrowed slice.  Use getIdxSpanItem per-iteration to
+    // read from the (possibly-relocated) backing array safely.
+    const expected_arg_span = switch (self.store.monotype_store.getMonotype(func_mono)) {
+        .func => |func| func.args,
+        else => Monotype.Span.empty(),
     };
     for (call_arg_exprs, 0..) |arg_idx, i| {
-        const expected_mono = if (i < expected_arg_monotypes.len) expected_arg_monotypes[i] else Monotype.Idx.none;
+        const expected_mono = if (i < expected_arg_span.len) self.store.monotype_store.getIdxSpanItem(expected_arg_span, i) else Monotype.Idx.none;
         const use_override = !expected_mono.isNone() and self.monotypeIsWellFormed(expected_mono);
         const lowered_arg = if (use_override)
             try self.lowerExprWithMonotypeOverrideIsolated(arg_idx, expected_mono)
@@ -7002,8 +7026,12 @@ fn lowerDotAccess(self: *Self, module_env: *const ModuleEnv, expr_idx: CIR.Expr.
         const explicit_args = module_env.store.sliceExpr(args_span);
         const func_expr = try self.lowerDispatchProcInstForExpr(expr_idx);
         const func_mono = self.store.typeOf(func_expr);
-        const expected_arg_monotypes = switch (self.store.monotype_store.getMonotype(func_mono)) {
-            .func => |func| self.store.monotype_store.getIdxSpan(func.args),
+        // Store the Span descriptor (a value type: start + len) instead of a
+        // slice into monotype_store.extra_idx.items.  The loop below calls
+        // lowerExpr / lowerExprWithMonotypeOverride* which may add monotypes,
+        // reallocating the backing array and invalidating any borrowed slice.
+        const expected_arg_span = switch (self.store.monotype_store.getMonotype(func_mono)) {
+            .func => |func| func.args,
             else => {
                 if (builtin.mode == .Debug) {
                     std.debug.panic(
@@ -7024,14 +7052,14 @@ fn lowerDotAccess(self: *Self, module_env: *const ModuleEnv, expr_idx: CIR.Expr.
         }
         for (explicit_args, 0..) |arg_idx, i| {
             const param_i = i + receiver_param_offset;
-            if (builtin.mode == .Debug and param_i >= expected_arg_monotypes.len) {
+            if (builtin.mode == .Debug and param_i >= expected_arg_span.len) {
                 std.debug.panic(
                     "MIR Lower invariant: dispatch proc arg arity mismatch for dot access '{s}' ({d} params, arg index {d})",
-                    .{ module_env.getIdent(da.field_name), expected_arg_monotypes.len, param_i },
+                    .{ module_env.getIdent(da.field_name), expected_arg_span.len, param_i },
                 );
             }
-            const arg_override = if (param_i < expected_arg_monotypes.len and self.monotypeIsWellFormed(expected_arg_monotypes[param_i]))
-                expected_arg_monotypes[param_i]
+            const arg_override = if (param_i < expected_arg_span.len and self.monotypeIsWellFormed(self.store.monotype_store.getIdxSpanItem(expected_arg_span, param_i)))
+                self.store.monotype_store.getIdxSpanItem(expected_arg_span, param_i)
             else
                 Monotype.Idx.none;
             const isolate_override = !arg_override.isNone() and try cirExprNeedsCallableOverrideIsolation(module_env, arg_idx);

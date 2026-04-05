@@ -397,6 +397,7 @@ pub const io_spec_tests = [_]TestSpec{
     //   - recursive_nominal_multi_param.roc    (Bug 1: build panic in LirCodeGen.generateLookup)
     //   - recursive_nominal_list_str_return.roc (Bug 2: runtime SIGSEGV at near-null address)
     //   - recursive_nominal_binary_tree.roc     (Bug 3: runtime stack overflow)
+    // See: /workspaces/software-engineering/docs/project/roc-bug-reports.md
 };
 
 /// Get the total number of IO spec tests

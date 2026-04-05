@@ -149,3 +149,16 @@ Creation-side fixes often fail because the necessary context (e.g., registered p
 Retrieval-side fixes succeed more often because by the time a caller asks for the data, the full context is available and you can rebuild the right version on demand.
 
 **When a creation-side fix fails twice, stop and investigate whether a retrieval-side fix is structurally possible instead.**
+
+### Dev backend (LirCodeGen.zig): specifics
+
+These are specific patterns that have caused bugs in the JIT code generator. Consult this before making any changes in `src/backend/dev/`.
+
+**Box layout vs. inner layout in `generateMatch` / `generateMatchStmt`:**
+When a tag union variant carries a recursive payload, the bound variable from a pattern (e.g., `Node(l, r) => ...`) has layout `.box` in LIR — it holds a heap pointer, not the payload bytes. If this variable is later used as a match scrutinee, `generateMatch` must detect the `.box` layout and dereference: load the pointer, copy `inner_size` bytes to a stack slot, use the inner layout for all discriminant setup and payload binding. If skipped, the 8-byte heap pointer (~0x7fff…) is compared against discriminant values like 0 and 1, and the comparison always misses — every branch falls through to the last one, producing silent infinite recursion or wrong results.
+
+**`elements_refcounted` must match the allocation site:**
+Lists carrying refcounted element types (e.g., `List(Str)`, `List(Box(…))`) are allocated with `elements_refcounted=true` (16-byte prefix). Passing `elements_refcounted=false` to any subsequent list operation (concat, realloc, free) causes it to compute `old_allocation = source_ptr - 8` instead of `source_ptr - 16`, reading garbage as allocation metadata — producing integer overflow or wrong-size realloc. Use `ls.layoutContainsRefcounted(element_layout)` to compute this correctly at call sites in `LirCodeGen.zig`.
+
+**Behavioral map coverage: test function arguments, not just inline:**
+A match that works on an inline value may silently fail when the value is a function parameter, because parameters of recursive types have different layouts at the LIR level. Always include a test variant where the value is passed to a helper function and matched inside it. "Inline passes, function fails" is the diagnostic fingerprint of a layout-level mismatch (e.g., `.box` vs. inner layout).

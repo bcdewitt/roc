@@ -905,21 +905,26 @@ pub const Store = struct {
         defer self.allocator.free(placeholders);
         for (placeholders) |*slot| slot.* = Idx.none;
 
+        const raw_placeholders = try self.allocator.alloc(Idx, graph.nodes.items.len);
+        defer self.allocator.free(raw_placeholders);
+        for (raw_placeholders) |*slot| slot.* = Idx.none;
+
         const Materializer = struct {
             store: *Self,
             graph: *const LayoutGraph,
             states: []MaterializeState,
             materialized: []Idx,
             placeholders: []Idx,
+            raw_placeholders: []Idx,
 
-            fn materializeRef(self_mat: *@This(), ref: GraphRef) std.mem.Allocator.Error!Idx {
+            fn materializeRef(self_mat: *@This(), ref: GraphRef, inside_heap_container: bool) std.mem.Allocator.Error!Idx {
                 return switch (ref) {
                     .canonical => |layout_idx| layout_idx,
-                    .local => |node_id| try self_mat.materializeNode(node_id),
+                    .local => |node_id| try self_mat.materializeNode(node_id, inside_heap_container),
                 };
             }
 
-            fn materializeNode(self_mat: *@This(), node_id: GraphNodeId) std.mem.Allocator.Error!Idx {
+            fn materializeNode(self_mat: *@This(), node_id: GraphNodeId, inside_heap_container: bool) std.mem.Allocator.Error!Idx {
                 const index = @intFromEnum(node_id);
                 if (self_mat.materialized[index] != Idx.none) {
                     return self_mat.materialized[index];
@@ -928,10 +933,22 @@ pub const Store = struct {
                 switch (self_mat.states[index]) {
                     .done => return self_mat.materialized[index],
                     .materializing => {
-                        if (self_mat.placeholders[index] == Idx.none) {
-                            self_mat.placeholders[index] = try self_mat.store.reserveLayout(Layout.box(.zst));
+                        if (inside_heap_container) {
+                            // Inside a List or Box — the container provides heap allocation.
+                            // Return a raw placeholder (NOT boxed) so the element layout
+                            // matches the unboxed type.
+                            if (self_mat.raw_placeholders[index] == Idx.none) {
+                                self_mat.raw_placeholders[index] = try self_mat.store.reserveLayout(Layout.box(.zst));
+                            }
+                            return self_mat.raw_placeholders[index];
+                        } else {
+                            // Not inside a heap container — need boxing to break
+                            // the infinite-size cycle.
+                            if (self_mat.placeholders[index] == Idx.none) {
+                                self_mat.placeholders[index] = try self_mat.store.reserveLayout(Layout.box(.zst));
+                            }
+                            return self_mat.placeholders[index];
                         }
-                        return self_mat.placeholders[index];
                     },
                     .unseen => {},
                 }
@@ -943,7 +960,7 @@ pub const Store = struct {
                 const result = switch (node) {
                     .pending => unreachable,
                     .box => |child| blk: {
-                        const child_idx = try self_mat.materializeRef(child);
+                        const child_idx = try self_mat.materializeRef(child, true);
                         const child_is_zst = self_mat.store.isZeroSized(self_mat.store.getLayout(child_idx));
                         if (self_mat.placeholders[index] != Idx.none) {
                             const raw_layout = if (child_is_zst) Layout.boxOfZst() else Layout.box(child_idx);
@@ -956,7 +973,7 @@ pub const Store = struct {
                             try self_mat.store.insertBox(child_idx);
                     },
                     .list => |child| blk: {
-                        const child_idx = try self_mat.materializeRef(child);
+                        const child_idx = try self_mat.materializeRef(child, true);
                         const child_is_zst = self_mat.store.isZeroSized(self_mat.store.getLayout(child_idx));
                         if (self_mat.placeholders[index] != Idx.none) {
                             const raw_layout = if (child_is_zst) Layout.listOfZst() else Layout.list(child_idx);
@@ -969,7 +986,7 @@ pub const Store = struct {
                             try self_mat.store.insertList(child_idx);
                     },
                     .closure => |child| blk: {
-                        const child_idx = try self_mat.materializeRef(child);
+                        const child_idx = try self_mat.materializeRef(child, false);
                         if (self_mat.placeholders[index] != Idx.none) {
                             self_mat.store.updateLayout(self_mat.placeholders[index], Layout.closure(child_idx));
                             break :blk self_mat.placeholders[index];
@@ -986,14 +1003,16 @@ pub const Store = struct {
                         for (graph_fields) |field| {
                             fields.appendAssumeCapacity(.{
                                 .index = field.index,
-                                .layout = try self_mat.materializeRef(field.child),
+                                .layout = try self_mat.materializeRef(field.child, false),
                             });
                         }
 
                         if (self_mat.placeholders[index] != Idx.none) {
+                            // Keep the boxed placeholder as a box wrapping the raw struct.
                             const raw_layout = try self_mat.store.buildUninternedStructLayout(fields.items);
-                            self_mat.store.updateLayout(self_mat.placeholders[index], raw_layout);
-                            break :blk self_mat.placeholders[index];
+                            const raw_idx = try self_mat.store.insertLayout(raw_layout);
+                            self_mat.store.updateLayout(self_mat.placeholders[index], Layout.box(raw_idx));
+                            break :blk raw_idx;
                         }
 
                         break :blk try self_mat.store.putStructFields(fields.items);
@@ -1006,13 +1025,30 @@ pub const Store = struct {
                         defer variants.deinit(self_mat.store.allocator);
                         try variants.ensureTotalCapacity(self_mat.store.allocator, graph_refs.len);
                         for (graph_refs) |variant_ref| {
-                            variants.appendAssumeCapacity(try self_mat.materializeRef(variant_ref));
+                            variants.appendAssumeCapacity(try self_mat.materializeRef(variant_ref, false));
                         }
 
                         if (self_mat.placeholders[index] != Idx.none) {
+                            // This node is the target of a recursive cycle. The boxed
+                            // placeholder is referenced by struct fields that need a
+                            // pointer-sized layout. Keep it as box(raw_tag_union).
+                            // Return the raw tag union as the materialized result.
                             const raw_layout = try self_mat.store.buildUninternedTagUnionLayout(variants.items);
-                            self_mat.store.updateLayout(self_mat.placeholders[index], raw_layout);
-                            break :blk self_mat.placeholders[index];
+                            const raw_idx = try self_mat.store.insertLayout(raw_layout);
+                            self_mat.store.updateLayout(self_mat.placeholders[index], Layout.box(raw_idx));
+                            // Also update the raw placeholder if one exists (used by
+                            // List/Box children that need the unboxed layout).
+                            if (self_mat.raw_placeholders[index] != Idx.none) {
+                                self_mat.store.updateLayout(self_mat.raw_placeholders[index], raw_layout);
+                            }
+                            break :blk raw_idx;
+                        }
+                        // If only a raw placeholder exists (no boxed placeholder),
+                        // update it with the raw layout.
+                        if (self_mat.raw_placeholders[index] != Idx.none) {
+                            const raw_layout = try self_mat.store.buildUninternedTagUnionLayout(variants.items);
+                            self_mat.store.updateLayout(self_mat.raw_placeholders[index], raw_layout);
+                            break :blk self_mat.raw_placeholders[index];
                         }
 
                         break :blk try self_mat.store.putTagUnion(variants.items);
@@ -1030,8 +1066,9 @@ pub const Store = struct {
             .states = materialize_states,
             .materialized = materialized,
             .placeholders = placeholders,
+            .raw_placeholders = raw_placeholders,
         };
-        const root_idx = try materializer.materializeRef(root);
+        const root_idx = try materializer.materializeRef(root, false);
 
         for (graph.nodes.items, 0..) |_, i| {
             if (materialized[i] == Idx.none) continue;
