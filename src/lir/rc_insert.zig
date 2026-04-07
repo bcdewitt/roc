@@ -5391,91 +5391,10 @@ pub fn insertRcOpsIntoSymbolDefsBestEffort(
 ) void {
     var def_iter = store.symbol_defs.iterator();
     while (def_iter.next()) |entry| {
-        // Skip symbol defs whose expression trees reference symbols that are
-        // not themselves in symbol_defs. Such expressions depend on ambient
-        // bindings (e.g. closure capture params) and cannot be correctly
-        // rewritten in isolation — the RC pass would introduce lookups for
-        // symbols that only exist inside a specific proc scope.
-        if (exprDependsOnAmbientBindings(store, entry.value_ptr.*)) continue;
-
         var fn_rc = RcInsertPass.init(allocator, store, layout_store) catch continue;
         defer fn_rc.deinit();
         entry.value_ptr.* = fn_rc.insertRcOps(entry.value_ptr.*) catch entry.value_ptr.*;
     }
-}
-
-/// Returns true if the expression tree contains any lookups to symbols that are
-/// not registered as top-level symbol defs. Such expressions depend on ambient
-/// bindings and cannot be safely rewritten out of context.
-fn exprDependsOnAmbientBindings(store: *const LirExprStore, expr_id: LirExprId) bool {
-    if (expr_id.isNone()) return false;
-    const expr = store.getExpr(expr_id);
-    return switch (expr) {
-        .lookup => |lu| store.getSymbolDef(lu.symbol) == null,
-        .struct_access => |sa| exprDependsOnAmbientBindings(store, sa.struct_expr),
-        .block => |block| blk: {
-            for (store.getStmts(block.stmts)) |stmt| {
-                const stmt_expr = switch (stmt) {
-                    .decl => |d| d.expr,
-                    .mutate => |m| m.expr,
-                    .cell_init => |c| c.expr,
-                    .cell_store => |c| c.expr,
-                    .cell_drop => continue,
-                };
-                if (exprDependsOnAmbientBindings(store, stmt_expr)) break :blk true;
-            }
-            break :blk exprDependsOnAmbientBindings(store, block.final_expr);
-        },
-        .struct_ => |s| blk: {
-            for (store.getExprSpan(s.fields)) |field_id| {
-                if (exprDependsOnAmbientBindings(store, field_id)) break :blk true;
-            }
-            break :blk false;
-        },
-        .nominal => |n| exprDependsOnAmbientBindings(store, n.backing_expr),
-        .tag => |t| blk: {
-            for (store.getExprSpan(t.args)) |arg_id| {
-                if (exprDependsOnAmbientBindings(store, arg_id)) break :blk true;
-            }
-            break :blk false;
-        },
-        .low_level => |ll| blk: {
-            for (store.getExprSpan(ll.args)) |arg_id| {
-                if (exprDependsOnAmbientBindings(store, arg_id)) break :blk true;
-            }
-            break :blk false;
-        },
-        .proc_call => |pc| blk: {
-            for (store.getExprSpan(pc.args)) |arg_id| {
-                if (exprDependsOnAmbientBindings(store, arg_id)) break :blk true;
-            }
-            break :blk false;
-        },
-        .if_then_else => |ite| blk: {
-            for (store.getIfBranches(ite.branches)) |branch| {
-                if (exprDependsOnAmbientBindings(store, branch.cond)) break :blk true;
-                if (exprDependsOnAmbientBindings(store, branch.body)) break :blk true;
-            }
-            break :blk exprDependsOnAmbientBindings(store, ite.final_else);
-        },
-        .dbg => |d| exprDependsOnAmbientBindings(store, d.expr),
-        // Leaf expressions with no sub-expressions
-        .i64_literal,
-        .i128_literal,
-        .f64_literal,
-        .f32_literal,
-        .dec_literal,
-        .str_literal,
-        .bool_literal,
-        .zero_arg_tag,
-        .runtime_error,
-        .crash,
-        .empty_list,
-        .break_expr,
-        => false,
-        // All other cases — conservatively treat as ambient-dependent to be safe
-        else => true,
-    };
 }
 
 test "RcInsertPass compiles" {

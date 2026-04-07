@@ -5689,19 +5689,8 @@ fn monotypeCanRefine(
 /// (e.g., List.concat, Str.concat), emit `run_low_level` instead of `call`.
 fn lowerProcInst(self: *Self, proc_inst_id: Monomorphize.ProcInstId) Allocator.Error!MIR.ExprId {
     const proc_inst_key = @intFromEnum(proc_inst_id);
-    const is_in_progress = self.in_progress_proc_insts.contains(proc_inst_key);
-    if (is_in_progress) {
-        // For closures with captures, the seed path's in_progress_expr
-        // contains lambda-internal symbols that are invalid outside the
-        // lambda body.  Instead of returning the stale expression, fall
-        // through so we can rebuild a correctly-scoped closure value
-        // (mirroring the lowered_proc_insts cached-closure path).
-        const pi = self.monomorphization.getProcInst(proc_inst_id);
-        const tmpl = self.monomorphization.getProcTemplate(pi.template);
-        const me = self.all_module_envs[tmpl.module_idx];
-        if (me.store.getExpr(tmpl.cir_expr) != .e_closure) {
-            return self.in_progress_proc_insts.get(proc_inst_key).?;
-        }
+    if (self.in_progress_proc_insts.get(proc_inst_key)) |in_progress| {
+        return in_progress;
     }
 
     const proc_inst = self.monomorphization.getProcInst(proc_inst_id);
@@ -5779,27 +5768,6 @@ fn lowerProcInst(self: *Self, proc_inst_id: Monomorphize.ProcInstId) Allocator.E
     }
 
     try self.bindProcTemplateBoundaryMonotypes(module_env, template.cir_expr, proc_monotype);
-
-    // For in-progress closures, rebuild a correctly-scoped closure value
-    // using the defining context (whose params are now registered), mirroring
-    // the lowered_proc_insts cached path below.
-    if (is_in_progress) {
-        const proc_id = self.reserved_proc_insts.get(proc_inst_key) orelse
-            self.lowered_proc_insts.get(proc_inst_key) orelse unreachable;
-        const closure = module_env.store.getExpr(template.cir_expr).e_closure;
-        return (try self.buildSpecializedClosureValue(
-            module_env,
-            template.cir_expr,
-            closure,
-            proc_monotype,
-            template.source_region,
-            proc_inst_id,
-            proc_id,
-            null,
-            null,
-            null,
-        )).proc_expr;
-    }
 
     if (self.lowered_proc_insts.get(proc_inst_key)) |cached_proc_id| {
         return switch (module_env.store.getExpr(template.cir_expr)) {

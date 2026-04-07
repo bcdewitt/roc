@@ -390,14 +390,6 @@ pub const io_spec_tests = [_]TestSpec{
         .io_spec = "1>done",
         .description = "Regression test: Monomorphize panic when callback always returns Ok but match expects Err tag",
     },
-
-    // Known bugs: recursive nominal type codegen failures.
-    // These .roc files exist in test/fx/ as regression tests, but they currently
-    // crash the dev backend. Enable them once the underlying bugs are fixed:
-    //   - recursive_nominal_multi_param.roc    (Bug 1: build panic in LirCodeGen.generateLookup)
-    //   - recursive_nominal_list_str_return.roc (Bug 2: runtime SIGSEGV at near-null address)
-    //   - recursive_nominal_binary_tree.roc     (Bug 3: runtime stack overflow)
-    // See: /workspaces/software-engineering/docs/project/roc-bug-reports.md
 };
 
 /// Get the total number of IO spec tests
