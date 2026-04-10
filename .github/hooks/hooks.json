@@ -1,0 +1,25 @@
+{
+    "hooks": {
+        "SessionStart": [
+            {
+                "type": "command",
+                "command": ".github/hooks/session-start.sh",
+                "timeout": 10
+            }
+        ],
+        "PostToolUse": [
+            {
+                "type": "command",
+                "command": ".github/hooks/post-tool-use.sh",
+                "timeout": 5
+            }
+        ],
+        "Stop": [
+            {
+                "type": "command",
+                "command": ".github/hooks/stop.sh",
+                "timeout": 5
+            }
+        ]
+    }
+}

@@ -4,6 +4,17 @@ This repo contains the source code for the Roc compiler and related tools. There
 
 All discussion, unless otherwise explicitly requested, is regarding the new version in zig. Ignore everything in the crates folder at the root of the repo, always exclude it from searches.
 
+## Fork Context
+
+This is a fork containing fixes for compiler bugs discovered during constraint-solver prototype development. See [BUGFIXES.md](BUGFIXES.md) for details on each fix branch.
+
+**Key references:**
+- [CONTRIBUTING.md](CONTRIBUTING.md) — Branching process, verification protocol, merge procedure
+- [BUGFIXES.md](BUGFIXES.md) — Fix branch details, verification results
+- `.github/instructions/` — Auto-loaded workflow rules (branching, snapshot testing)
+- `.github/agents/debugger.agent.md` — Hypothesis-driven debugging agent
+- `.github/hooks/` — SessionStart (branch awareness), PostToolUse (reinforcement), Stop (clean state)
+
 ## Git Usage
 
 **All use of git is strictly forbidden for diagnostic purposes.** Do not use git stash, git diff, git log, or any other git commands to investigate whether issues are pre-existing or to compare with previous states. Focus exclusively on fixing the current problem. Whether an issue existed before is irrelevant information.

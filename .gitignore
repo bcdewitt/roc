@@ -154,5 +154,8 @@ kcov-output/
 .direnv
 .mcp.json
 
+# Agent working state (ephemeral, not for upstream)
+.session/
+
 # Generated glue output files
 test/glue/*/roc_platform_abi.zig
