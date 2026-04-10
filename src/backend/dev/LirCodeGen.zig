@@ -1857,7 +1857,13 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     if (elem_size <= 8) {
                         const vs = ValueSize.fromByteCount(@intCast(elem_size));
                         try self.emitSizedLoadMem(temp_reg, addr_reg, 0, vs);
-                        try self.emitSizedStoreMem(frame_ptr, elem_slot, temp_reg, vs);
+                        // Always store the full 8 bytes: emitSizedLoadMem zero-extends
+                        // into the 64-bit register, so all upper bytes are clean zeros.
+                        // The stack slot is 8-byte aligned (allocStackSlot rounds up),
+                        // so this is safe. Storing only elem_size bytes would leave
+                        // uninitialized upper bytes that corrupt qword-sized loads
+                        // in downstream comparison ops (Bug 26).
+                        try self.codegen.emitStoreStack(.w64, elem_slot, temp_reg);
                     } else {
                         // For larger elements, copy in 8-byte chunks
                         try self.copyChunked(temp_reg, addr_reg, 0, frame_ptr, elem_slot, elem_size);
