@@ -1034,8 +1034,17 @@ const Unifier = struct {
             return error.TypeMismatch;
         }
 
-        // Unify each pair of arguments first (recursion guard in unifyGuarded prevents infinite loops)
-        // Use iterators instead of slices because unifyGuarded may trigger reallocations
+        // Early merge so self-referential types don't infinitely recurse.
+        // This is critical for recursive nominal types like:
+        //   Node(a) := [One(a), Many(List(Node(a)))]
+        // Without early merge, unifying the type arguments can trigger
+        // unification of the backing types, which recursively unifies
+        // the nominal type with itself, creating infinite recursion.
+        // (Upstream fix: PR #8984)
+        self.merge(vars, vars.b.desc.content);
+
+        // Unify each pair of arguments using iterators (not slices,
+        // because unifyGuarded may trigger reallocations).
         var a_args_iter = self.types_store.iterNominalArgs(a_type);
         var b_args_iter = self.types_store.iterNominalArgs(b_type);
         while (a_args_iter.next()) |a_arg| {
@@ -1043,13 +1052,11 @@ const Unifier = struct {
             try self.unifyGuarded(a_arg, b_arg);
         }
 
-        // Merge after all checks pass.
-        // We intentionally do not unify backing vars here: nominal identity is
-        // defined by origin/name/args, and forcing backing vars to coincide at
-        // unification time over-constrains row-polymorphic nominals like Try.
-        // MIR monotype lowering substitutes formal nominal params into backing
-        // types explicitly when it strips nominal wrappers.
-        self.merge(vars, vars.b.desc.content);
+        // Note: we intentionally do not unify backing vars here. Nominal
+        // identity is defined by origin/name/args, and forcing backing vars
+        // to coincide at unification time over-constrains row-polymorphic
+        // nominals like Try. MIR monotype lowering substitutes formal nominal
+        // params into backing types when it strips nominal wrappers.
     }
 
     fn unifyTagUnionWithNominal(
