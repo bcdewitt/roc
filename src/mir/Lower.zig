@@ -153,6 +153,11 @@ in_progress_symbol_monotypes: std.AutoHashMap(u64, Monotype.Idx),
 /// dispatch resolution data directly.
 resolved_dispatch_targets: std.AutoHashMap(u64, ResolvedDispatchTarget),
 
+/// Nominal type vars currently being lowered by lowerStrInspectNominal.
+/// Detects cycles for recursive nominal types (e.g. Chain := [End, Link(Chain)])
+/// so lowerStrInspectNominal can emit a placeholder instead of recursing forever.
+str_inspect_visiting: std.AutoHashMap(types.Var, void),
+
 scratch_expr_ids: base.Scratch(MIR.ExprId),
 scratch_pattern_ids: base.Scratch(MIR.PatternId),
 scratch_ident_idxs: base.Scratch(Ident.Idx),
@@ -219,6 +224,7 @@ pub fn init(
         .current_root_expr_context = null,
         .in_progress_symbol_monotypes = std.AutoHashMap(u64, Monotype.Idx).init(allocator),
         .resolved_dispatch_targets = resolved_dispatch_targets,
+        .str_inspect_visiting = std.AutoHashMap(types.Var, void).init(allocator),
         .scratch_expr_ids = try base.Scratch(MIR.ExprId).init(allocator),
         .scratch_pattern_ids = try base.Scratch(MIR.PatternId).init(allocator),
         .scratch_ident_idxs = try base.Scratch(Ident.Idx).init(allocator),
@@ -252,6 +258,7 @@ pub fn deinit(self: *Self) void {
     self.skipped_proc_backed_binding_patterns.deinit();
     self.in_progress_symbol_monotypes.deinit();
     self.resolved_dispatch_targets.deinit();
+    self.str_inspect_visiting.deinit();
     self.scratch_expr_ids.deinit();
     self.scratch_pattern_ids.deinit();
     self.scratch_ident_idxs.deinit();
@@ -1927,6 +1934,18 @@ fn lowerStrInspectNominal(
     nominal: types.NominalType,
     region: Region,
 ) Allocator.Error!MIR.ExprId {
+    // Cycle detection for recursive nominal types (e.g. Chain := [End, Link(Chain)]).
+    // Use the resolved type var as the key so all references to the same recursive
+    // Chain resolve to the same entry.
+    const resolved_var = type_env.types.resolveVar(type_var).var_;
+    if (self.str_inspect_visiting.contains(resolved_var)) {
+        // This nominal is already being inspected upstream in the call chain.
+        // Break the cycle by emitting a self-referential placeholder.
+        return self.emitMirStrLiteral("<recursive>", region);
+    }
+    try self.str_inspect_visiting.put(resolved_var, {});
+    defer _ = self.str_inspect_visiting.remove(resolved_var);
+
     const common = ModuleEnv.CommonIdents.find(&type_env.common);
     const ident = nominal.ident.ident_idx;
 

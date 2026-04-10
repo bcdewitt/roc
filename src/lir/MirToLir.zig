@@ -578,15 +578,25 @@ fn registerSpecializedMonotypeLayout(
         .tag_union => |tu| {
             const tags = self.mir_store.monotype_store.getTags(tu.tags);
             if (tags.len == 0) return;
-            if (builtin.mode == .Debug and layout_val.tag != .tag_union) {
+
+            // For recursive types, the layout may be .box wrapping a .tag_union.
+            // Unwrap the box to get the actual tag_union layout.
+            var effective_layout_idx = layout_idx;
+            var effective_layout_val = layout_val;
+            if (effective_layout_val.tag == .box) {
+                effective_layout_idx = effective_layout_val.data.box;
+                effective_layout_val = self.layout_store.getLayout(effective_layout_idx);
+            }
+
+            if (builtin.mode == .Debug and effective_layout_val.tag != .tag_union) {
                 std.debug.panic(
                     "MirToLir invariant violated: non-empty tag union monotype must specialize to tag_union layout, got mono_idx={d} mono={any} layout_idx={d} tag={s}",
-                    .{ mono_key, monotype, @intFromEnum(layout_idx), @tagName(layout_val.tag) },
+                    .{ mono_key, monotype, @intFromEnum(effective_layout_idx), @tagName(effective_layout_val.tag) },
                 );
             }
-            if (layout_val.tag != .tag_union) return;
+            if (effective_layout_val.tag != .tag_union) return;
 
-            const union_data = self.layout_store.getTagUnionData(layout_val.data.tag_union.idx);
+            const union_data = self.layout_store.getTagUnionData(effective_layout_val.data.tag_union.idx);
             const union_layouts = self.layout_store.getTagUnionVariants(union_data);
             for (tags, 0..) |tag, i| {
                 if (i >= union_layouts.len) break;
